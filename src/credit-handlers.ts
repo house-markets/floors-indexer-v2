@@ -41,6 +41,11 @@ CreditFacility.LoanCreated.handler(
     const borrower = await getOrCreateAccount(context, event.params.borrower_)
     const loanId = event.params.loanId_.toString()
 
+    // Fetch floor price from Market entity (updated by FloorPriceUpdated events)
+    // This is more reliable than the contract call which doesn't include floorPriceAtBorrow
+    const market = await context.Market.get(facility.market_id)
+    const floorPriceRaw = market?.floorPriceRaw ?? 0n
+
     const loanStateResult = await fetchLoanStateEffect(context.effect)({
       chainId: event.chainId,
       facilityAddress: event.srcAddress,
@@ -49,7 +54,6 @@ CreditFacility.LoanCreated.handler(
     const onChainLoan = parseLoanStateResult(loanStateResult)
     const lockedCollateralRaw = onChainLoan?.lockedIssuanceTokens ?? 0n
     const remainingDebtRaw = onChainLoan?.remainingLoanAmount ?? event.params.loanAmount_
-    const floorPriceRaw = onChainLoan?.floorPriceAtBorrow ?? 0n
 
     const borrowAmount = formatAmount(event.params.loanAmount_, borrowToken.decimals)
     const lockedCollateral = formatAmount(lockedCollateralRaw, collateralToken.decimals)
@@ -319,14 +323,20 @@ CreditFacility.LoanClosed.handler(
         : 0n
     const lockedCollateral = formatAmount(nextLockedCollateralRaw, collateralToken.decimals)
 
+    // LoanClosed unlocks collateral but doesn't necessarily mean debt is paid
+    // Only LoanRepaid should modify remainingDebt; preserve existing debt state here
+    const isDebtFullyPaid = loan.remainingDebtRaw === 0n
+    const nextStatus: LoanStatus_t = isDebtFullyPaid ? 'REPAID' : loan.status
+    const nextClosedAt = isDebtFullyPaid ? timestamp : loan.closedAt
+
     const updatedLoan = {
       ...loan,
       lockedCollateralRaw: nextLockedCollateralRaw,
       lockedCollateralFormatted: lockedCollateral.formatted,
-      remainingDebtRaw: 0n,
-      remainingDebtFormatted: formatAmount(0n, borrowToken.decimals).formatted,
-      status: 'REPAID' as LoanStatus_t,
-      closedAt: timestamp,
+      // Keep existing debt - only LoanRepaid should modify this
+      // remainingDebtRaw and remainingDebtFormatted inherited via spread
+      status: nextStatus,
+      closedAt: nextClosedAt,
       lastUpdatedAt: timestamp,
     }
     context.Loan.set(updatedLoan)
@@ -356,8 +366,8 @@ CreditFacility.LoanClosed.handler(
 
     recordLoanStatusHistory(context, {
       loanId,
-      status: 'REPAID',
-      remainingDebtRaw: 0n,
+      status: nextStatus,
+      remainingDebtRaw: loan.remainingDebtRaw,
       lockedCollateralRaw: nextLockedCollateralRaw,
       borrowTokenDecimals: borrowToken.decimals,
       collateralTokenDecimals: collateralToken.decimals,
@@ -467,6 +477,29 @@ CreditFacility.LoansConsolidated.handler(
     const borrower = await getOrCreateAccount(context, event.params.borrower_)
     const newLoanId = event.params.newLoanId_.toString()
 
+    // Collect values from old loans first (before closing them)
+    let totalBorrowAmountRaw = 0n
+    let totalRemainingDebtRaw = 0n
+    let totalOriginationFeeRaw = 0n
+    let weightedFloorPriceSum = 0n
+    let totalCollateralWeight = 0n
+
+    for (const oldLoanId of event.params.oldLoanIds_) {
+      const oldLoan = await context.Loan.get(oldLoanId.toString())
+      if (oldLoan) {
+        totalBorrowAmountRaw += oldLoan.borrowAmountRaw
+        totalRemainingDebtRaw += oldLoan.remainingDebtRaw
+        totalOriginationFeeRaw += oldLoan.originationFeeRaw
+        // Weight floor price by collateral (more collateral = more weight)
+        weightedFloorPriceSum += oldLoan.floorPriceAtBorrowRaw * oldLoan.lockedCollateralRaw
+        totalCollateralWeight += oldLoan.lockedCollateralRaw
+      }
+    }
+
+    // Calculate weighted average floor price
+    const avgFloorPriceRaw =
+      totalCollateralWeight > 0n ? weightedFloorPriceSum / totalCollateralWeight : 0n
+
     // Close old loans
     for (const oldLoanId of event.params.oldLoanIds_) {
       const oldLoan = await context.Loan.get(oldLoanId.toString())
@@ -481,7 +514,7 @@ CreditFacility.LoansConsolidated.handler(
       }
     }
 
-    // Create new consolidated loan
+    // Create new consolidated loan with summed values from old loans
     const consolidatedLoan = {
       id: newLoanId,
       borrower_id: borrower.id,
@@ -492,14 +525,14 @@ CreditFacility.LoansConsolidated.handler(
         event.params.totalLockedIssuanceTokens_,
         collateralToken.decimals
       ).formatted,
-      borrowAmountRaw: 0n, // Will be calculated from old loans
-      borrowAmountFormatted: '0',
-      originationFeeRaw: 0n,
-      originationFeeFormatted: '0',
-      remainingDebtRaw: 0n, // Will be calculated from old loans
-      remainingDebtFormatted: '0',
-      floorPriceAtBorrowRaw: 0n,
-      floorPriceAtBorrowFormatted: '0',
+      borrowAmountRaw: totalBorrowAmountRaw,
+      borrowAmountFormatted: formatAmount(totalBorrowAmountRaw, borrowToken.decimals).formatted,
+      originationFeeRaw: totalOriginationFeeRaw,
+      originationFeeFormatted: formatAmount(totalOriginationFeeRaw, borrowToken.decimals).formatted,
+      remainingDebtRaw: totalRemainingDebtRaw,
+      remainingDebtFormatted: formatAmount(totalRemainingDebtRaw, borrowToken.decimals).formatted,
+      floorPriceAtBorrowRaw: avgFloorPriceRaw,
+      floorPriceAtBorrowFormatted: formatAmount(avgFloorPriceRaw, borrowToken.decimals).formatted,
       status: 'ACTIVE' as LoanStatus_t,
       openedAt: timestamp,
       closedAt: undefined,
